@@ -35,5 +35,20 @@ public enum DecisionCode {
 
     /* ---- 重启恢复 ---- */
     RECOVERED_ON_STARTUP,           // 启动时加载快照，未确认租约重置为待投递
+
+    /* ---- 运维：死信重投（人工补偿） ---- */
+    DEAD_LETTER_REPLAY_ACCEPTED,    // 死信重投被接受，消息作为同一消息的延续重新可投递
+    REPLAY_REJECTED_NOT_DEAD,       // 目标消息不是 DEAD 终态，不能死信重投
+    REPLAY_REJECTED_OFFSET_MISSING, // 死信重投目标位点不存在
+    REPLAY_DISPATCHED,              // 死信重投后的投递（attemptNo 延续历史，非新消息）
+
+    /* ---- 运维：消费进度回退重放 ---- */
+    OFFSET_REWIND_ACCEPTED,         // 消费进度回退被接受，历史位点重新可投递
+    REWIND_REJECTED_RANGE,          // 回退目标位点 < 0 或超出最大位点
+    REWIND_REJECTED_NOT_BEHIND,     // 回退目标不早于当前已提交位点（没有更早的位置可退）
+    REWIND_REJECTED_INFLIGHT,       // 回退区间内存在尚未确认（IN_FLIGHT）的消息
+    REPLAY_DELIVERED,               // 进度回退后的重放投递（非新消息）
+    DUPLICATE_EFFECT_SUPPRESSED,    // 重放的消息此前已成功生效，本次业务效果被幂等抑制（只留痕）
+
     PERSISTED                       // 状态已持久化
 }

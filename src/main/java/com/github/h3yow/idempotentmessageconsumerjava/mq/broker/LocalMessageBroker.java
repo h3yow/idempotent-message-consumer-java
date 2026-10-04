@@ -13,12 +13,18 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
+
+import com.github.h3yow.idempotentmessageconsumerjava.mq.model.DeliveryKind;
+import com.github.h3yow.idempotentmessageconsumerjava.mq.model.ReplayRecord;
+import com.github.h3yow.idempotentmessageconsumerjava.mq.ops.ReplayRejectedException;
 
 /**
  * 本地消息中间件模拟实现，承担四类职责：
@@ -41,6 +47,7 @@ public class LocalMessageBroker {
     private final ReentrantLock lock = new ReentrantLock();
     private final BrokerStore.BrokerState state;
     private final Map<String, ConsumerGroupConfig> configs = new ConcurrentHashMap<>();
+    private final Set<String> recoveredGroups = new HashSet<>();
     private final List<TraceEvent> trace = new CopyOnWriteArrayList<>();
     private long traceSeq;
 
@@ -52,7 +59,8 @@ public class LocalMessageBroker {
         this.store = store;
         this.clock = clock;
         this.state = store.load();
-        recover();
+        // 兼容旧快照：补齐新增字段
+        state.getGroups().values().forEach(GroupSnapshot::normalizeAfterLoad);
     }
 
     private long now() {
@@ -63,6 +71,7 @@ public class LocalMessageBroker {
 
     /**
      * 注册（重启后为重新关联）消费者组配置。组快照已存在时沿用磁盘上的位点与轨迹。
+     * 重启后第一次注册某个组时，对该组执行一次“未确认租约恢复”。
      */
     public void registerGroup(ConsumerGroupConfig config) {
         lock.lock();
@@ -73,54 +82,69 @@ public class LocalMessageBroker {
                         + "' already registered with topic '" + old.topic()
                         + "', cannot rebind to '" + config.topic() + "'");
             }
-            state.getGroups().computeIfAbsent(config.group(), g -> new GroupSnapshot(g));
+            GroupSnapshot snap =
+                    state.getGroups().computeIfAbsent(config.group(), g -> new GroupSnapshot(g));
+            snap.normalizeAfterLoad();
+            if (recoveredGroups.add(config.group())) {
+                recoverGroup(config, snap);
+            }
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * 重启恢复：将快照中仍为 IN_FLIGHT 的租约视为“进程死亡导致未确认”，
+     * 重启恢复（按组）：将快照中仍为 IN_FLIGHT 的租约视为“进程死亡导致未确认”，
      * 追加 LEASE_TIMEOUT 轨迹后重置为 PENDING，立即可被重新投递；不改变任何终态。
+     *
+     * <p>尝试额度账对齐：之前已消耗的尝试次数继续算数。回收占满最后一次尝试额度
+     * （{@code attemptCount >= maxAttempts}）的消息不再给新的投递机会，直接进入死信，
+     * 重启不能突破配置的重试上限、也不能把已耗尽的消息无限重投。</p>
      */
-    private void recover() {
-        lock.lock();
-        try {
-            long t = now();
-            for (GroupSnapshot snap : state.getGroups().values()) {
-                int recovered = 0;
-                for (GroupSnapshot.Entry e : snap.getEntries()) {
-                    if (e.state == MessageState.IN_FLIGHT) {
-                        AttemptRecord rec = new AttemptRecord(
-                                e.attemptCount,
-                                e.currentConsumerId,
-                                e.leaseExpiresAt > 0 ? e.leaseExpiresAt : t,
-                                t,
-                                AttemptResult.LEASE_TIMEOUT,
-                                "RECOVERED_AFTER_RESTART_UNACKED",
-                                "broker restarted before lease=" + e.currentLeaseId
-                                        + " was acknowledged; message is redeliverable");
-                        e.attempts.add(rec);
-                        e.state = MessageState.PENDING;
-                        e.currentLeaseId = null;
-                        e.currentConsumerId = null;
-                        e.leaseExpiresAt = 0;
-                        e.nextVisibleAt = t;
-                        recovered++;
-                    }
-                }
-                if (recovered > 0) {
-                    emit(snap.getGroup(), null, -1, DecisionCode.RECOVERED_ON_STARTUP,
-                            recovered + " in-flight lease(s) reset to PENDING and will be redelivered; "
-                                    + "committedOffset=" + snap.getCommittedOffset()
-                                    + ", terminal states untouched");
+    private void recoverGroup(ConsumerGroupConfig cfg, GroupSnapshot snap) {
+        long t = now();
+        int recovered = 0;
+        int exhausted = 0;
+        boolean changed = false;
+        for (GroupSnapshot.Entry e : snap.getEntries()) {
+            if (e.state == MessageState.IN_FLIGHT) {
+                String oldLease = e.currentLeaseId;
+                AttemptRecord rec = new AttemptRecord(
+                        e.attemptCount,
+                        e.currentConsumerId,
+                        e.leaseExpiresAt > 0 ? e.leaseExpiresAt : t,
+                        t,
+                        AttemptResult.LEASE_TIMEOUT,
+                        "RECOVERED_AFTER_RESTART_UNACKED",
+                        "broker restarted before lease=" + oldLease
+                                + " was acknowledged; consumed attempt budget stays counted",
+                        e.activeReplayKind == null ? DeliveryKind.NORMAL : e.activeReplayKind);
+                e.attempts.add(rec);
+                e.currentLeaseId = null;
+                e.currentConsumerId = null;
+                e.leaseExpiresAt = 0;
+                e.nextVisibleAt = t;
+                recovered++;
+                changed = true;
+                if (e.attemptCount >= cfg.maxAttempts()) {
+                    // 额度已耗尽：不再给投递机会，老老实实进死信（重启不增加投递机会）
+                    e.state = MessageState.PENDING;
+                    moveToDead(snap, e, cfg, "MAX_ATTEMPTS_REACHED", t);
+                    exhausted++;
+                } else {
+                    e.state = MessageState.PENDING;
                 }
             }
-            if (state.getMessages().size() > 0) {
-                store.persist(state);
-            }
-        } finally {
-            lock.unlock();
+        }
+        if (recovered > 0) {
+            emit(snap.getGroup(), null, -1, DecisionCode.RECOVERED_ON_STARTUP,
+                    recovered + " in-flight lease(s) reset after restart; " + exhausted
+                            + " of them had exhausted the attempt budget and went straight to "
+                            + "dead-letter; committedOffset=" + snap.getCommittedOffset()
+                            + ", terminal states untouched");
+            store.persist(state);
+        } else if (changed) {
+            store.persist(state);
         }
     }
 
@@ -199,11 +223,16 @@ public class LocalMessageBroker {
         for (GroupSnapshot.Entry e : snap.getEntries()) {
             if (e.state == MessageState.IN_FLIGHT && e.leaseExpiresAt <= t) {
                 String oldLease = e.currentLeaseId;
+                DeliveryKind kind = e.activeReplayKind == null
+                        ? DeliveryKind.NORMAL : e.activeReplayKind;
                 AttemptRecord rec = new AttemptRecord(
                         e.attemptCount, e.currentConsumerId, e.leaseExpiresAt, t,
                         AttemptResult.LEASE_TIMEOUT, "LEASE_TIMEOUT_REDELIVER",
                         "lease=" + oldLease + " expired at " + e.leaseExpiresAt
-                                + " without ack/nack; message becomes redeliverable");
+                                + " without ack/nack; message becomes redeliverable"
+                                + (kind == DeliveryKind.NORMAL ? ""
+                                        : " (still within replay round #" + e.activeReplayNo + ")"),
+                        kind);
                 e.attempts.add(rec);
                 e.state = MessageState.PENDING;
                 e.currentLeaseId = null;
@@ -211,7 +240,8 @@ public class LocalMessageBroker {
                 e.leaseExpiresAt = 0;
                 e.nextVisibleAt = t;
                 emit(groupName(cfg), e.messageId, e.offset, DecisionCode.LEASE_TIMED_OUT,
-                        "lease timed out: leaseId=" + oldLease + " attemptNo=" + e.attemptCount);
+                        "lease timed out: leaseId=" + oldLease + " attemptNo=" + e.attemptCount
+                                + " replayNo=" + e.activeReplayNo);
                 if (e.attemptCount >= cfg.maxAttempts()) {
                     moveToDead(snap, e, cfg, "MAX_ATTEMPTS_REACHED", t);
                     store.persist(state);
@@ -226,16 +256,27 @@ public class LocalMessageBroker {
         e.attemptCount++;
         String leaseId = UUID.randomUUID().toString();
         long expires = t + cfg.leaseDuration().toMillis();
+        DeliveryKind kind = e.activeReplayKind == null ? DeliveryKind.NORMAL : e.activeReplayKind;
         e.state = MessageState.IN_FLIGHT;
         e.currentLeaseId = leaseId;
         e.currentConsumerId = consumerId;
         e.leaseExpiresAt = expires;
         LeasedMessage lease = new LeasedMessage(leaseId, cfg.group(), e.offset, message,
-                e.attemptCount, t, expires);
-        emit(groupName(cfg), e.messageId, e.offset, DecisionCode.DISPATCHED,
+                e.attemptCount, t, expires, kind, e.activeReplayNo);
+        DecisionCode code = switch (kind) {
+            case DEAD_LETTER_REPLAY -> DecisionCode.REPLAY_DISPATCHED;
+            case OFFSET_REWIND -> DecisionCode.REPLAY_DELIVERED;
+            case NORMAL -> DecisionCode.DISPATCHED;
+        };
+        String kindTag = switch (kind) {
+            case DEAD_LETTER_REPLAY -> "MANUAL_DEAD_LETTER_REPLAY#" + e.activeReplayNo;
+            case OFFSET_REWIND -> "OFFSET_REWIND_REPLAY#" + e.activeReplayNo;
+            case NORMAL -> e.attemptCount == 1 ? "PENDING(first)" : "retry";
+        };
+        emit(groupName(cfg), e.messageId, e.offset, code,
                 "dispatched: consumer=" + consumerId + " attemptNo=" + e.attemptCount
-                        + " leaseExpiresAt=" + expires + " state was "
-                        + (e.attemptCount == 1 ? "PENDING(first)" : "retry"));
+                        + " leaseExpiresAt=" + expires + " kind=" + kindTag
+                        + " (same message continuation, not a new message)");
         store.persist(state);
         return lease;
     }
@@ -291,7 +332,8 @@ public class LocalMessageBroker {
             };
             AttemptRecord rec = new AttemptRecord(
                     lease.attemptNo(), e.currentConsumerId,
-                    lease.grantedAt(), t, result, outcome.reason(), detail);
+                    lease.grantedAt(), t, result, outcome.reason(), detail,
+                    lease.deliveryKind());
             e.attempts.add(rec);
             e.currentLeaseId = null;
             e.leaseExpiresAt = 0;
@@ -300,9 +342,27 @@ public class LocalMessageBroker {
                 case SUCCESS -> {
                     e.state = MessageState.SUCCEEDED;
                     e.currentConsumerId = null;
-                    emit(lease.group(), e.messageId, e.offset, DecisionCode.ACK_SUCCEEDED,
-                            "success acknowledged, business effect committed once: attemptNo="
-                                    + lease.attemptNo() + " reason=" + outcome.reason());
+                    boolean firstEffect = !e.succeededOnce;
+                    e.succeededOnce = true;
+                    int finishedReplayNo = e.activeReplayNo;
+                    String finishedReplayOperator = e.activeReplayOperator;
+                    clearActiveReplay(e);
+                    if (firstEffect) {
+                        emit(lease.group(), e.messageId, e.offset, DecisionCode.ACK_SUCCEEDED,
+                                "success acknowledged, business effect committed once: attemptNo="
+                                        + lease.attemptNo() + " kind=" + lease.deliveryKind()
+                                        + " reason=" + outcome.reason());
+                    } else {
+                        // 回退重放以前成功过的消息：处理器确实又跑了一次，但业务效果幂等抑制，只留痕
+                        emit(lease.group(), e.messageId, e.offset,
+                                DecisionCode.DUPLICATE_EFFECT_SUPPRESSED,
+                                "replayed message had already taken effect in this group; "
+                                        + "handler ran again but business effect is suppressed once: "
+                                        + "attemptNo=" + lease.attemptNo()
+                                        + " replayNo=" + finishedReplayNo
+                                        + " operator=" + finishedReplayOperator
+                                        + " reason=" + outcome.reason());
+                    }
                     advanceCommittedOffset(cfg, snap, t);
                 }
                 case RETRY -> {
@@ -316,7 +376,8 @@ public class LocalMessageBroker {
                         emit(lease.group(), e.messageId, e.offset, DecisionCode.NACK_RETRY_SCHEDULED,
                                 "retryable failure: attemptNo=" + e.attempts.size()
                                         + "/" + cfg.maxAttempts() + " backoffMs=" + backoff
-                                        + " nextVisibleAt=" + e.nextVisibleAt + " reason=" + detail);
+                                        + " nextVisibleAt=" + e.nextVisibleAt + " replayNo="
+                                        + e.activeReplayNo + " reason=" + detail);
                     }
                 }
                 case DEAD -> moveToDead(snap, e, cfg, "NON_RETRYABLE_BY_HANDLER", t);
@@ -332,17 +393,30 @@ public class LocalMessageBroker {
         e.state = MessageState.DEAD;
         e.currentConsumerId = null;
         e.nextVisibleAt = 0;
+        int replayNo = e.activeReplayNo;
+        String operator = e.activeReplayOperator;
+        clearActiveReplay(e);
         Message message = state.getMessages().get(e.messageId);
-        DeadLetter dl = new DeadLetter(message, cfg.group(), new ArrayList<>(e.attempts), t, cause);
+        DeadLetter dl = new DeadLetter(message, cfg.group(), new ArrayList<>(e.attempts), t,
+                cause, replayNo, operator);
         state.getDeadLetters().add(dl);
         DecisionCode code = "NON_RETRYABLE_BY_HANDLER".equals(cause)
                 ? DecisionCode.NACK_NON_RETRYABLE
                 : DecisionCode.NACK_RETRY_EXHAUSTED;
         emit(cfg.group(), e.messageId, e.offset, code,
                 "moved to dead-letter: cause=" + cause + " attempts=" + e.attempts.size()
-                        + " maxAttempts=" + cfg.maxAttempts() + " (original message and all "
-                        + "attempt records retained)");
+                        + " maxAttempts=" + cfg.maxAttempts()
+                        + (replayNo > 0 ? " replayNo=" + replayNo + " operator=" + operator
+                        : " (original death, replayNo=0)")
+                        + " (original message and all attempt records retained; "
+                        + "previous dead-letter record is not erased)");
         advanceCommittedOffset(cfg, snap, t);
+    }
+
+    private static void clearActiveReplay(GroupSnapshot.Entry e) {
+        e.activeReplayNo = 0;
+        e.activeReplayKind = DeliveryKind.NORMAL;
+        e.activeReplayOperator = null;
     }
 
     /** 把连续终态水位向前推进（仅前进，绝不回退）。 */
@@ -415,6 +489,209 @@ public class LocalMessageBroker {
         throw new OffsetCommitRejectedException(group, requested, current, code, detail);
     }
 
+    // ------------------------------------------------------ 运维：死信重投 / 进度回退
+
+    /** 人工死信重投（默认操作人）。 */
+    public ReplayRecord replayDeadLetter(String group, long offset, String reason) {
+        return replayDeadLetter(group, offset, "manual-operator", reason);
+    }
+
+    /**
+     * 人工死信重投：把已进入死信的同一条消息作为<b>延续</b>（不是新消息）重新放回本组再处理。
+     *
+     * <p>语义与边界：</p>
+     * <ul>
+     *   <li>只有 {@code DEAD} 终态的消息可重投；其他状态以可区分编码拒绝，状态保持原样；</li>
+     *   <li>原有死信记录一条都不删，审计轨迹明确记录操作人/原因/这是第几次重放；</li>
+     *   <li>重放投递的 attemptNo 延续历史序号，重放只给“一次投递机会”：此后再失败仍受
+     *       组配置的 {@code maxAttempts} 约束（自动退避重试的剩余额度=maxAttempts-attemptCount），
+     *       不会因为人工介入而获得无限机会；</li>
+     *   <li>若该位点在已提交水线之前，水线同步回退到该位点之前（运维操作是水线唯一允许的回退），
+     *       回退不会越过任何更低位的未确认消息；</li>
+     *   <li>与并发消费共存：全程持同一把锁，校验与变更原子完成，失败不留下半完成进度。</li>
+     * </ul>
+     */
+    public ReplayRecord replayDeadLetter(String group, long offset,
+                                         String operator, String reason) {
+        lock.lock();
+        try {
+            ConsumerGroupConfig cfg = requireGroup(group);
+            GroupSnapshot snap = state.getGroups().get(group);
+            long current = snap.getCommittedOffset();
+            GroupSnapshot.Entry e = snap.entryAt(offset);
+            if (e == null) {
+                rejectReplay(group, offset, current, DecisionCode.REPLAY_REJECTED_OFFSET_MISSING,
+                        "dead-letter replay rejected: offset=" + offset + " does not exist"
+                                + " (maxOffset=" + (snap.getEntries().size() - 1L) + ")");
+            }
+            assert e != null;
+            if (e.state != MessageState.DEAD) {
+                rejectReplay(group, offset, current, DecisionCode.REPLAY_REJECTED_NOT_DEAD,
+                        "dead-letter replay rejected: offset=" + offset + " messageId="
+                                + e.messageId + " is " + e.state
+                                + ", only DEAD messages can be manually replayed");
+            }
+            long t = now();
+            int replayNo = e.replayCount() + 1;
+            ReplayRecord rec = new ReplayRecord(replayNo, DeliveryKind.DEAD_LETTER_REPLAY,
+                    operator, reason, e.offset, e.messageId, t);
+            e.replays.add(rec);
+            // 同一消息的延续：attemptCount/attempts/死信历史全部保留，只重新开放投递
+            e.state = MessageState.PENDING;
+            e.currentLeaseId = null;
+            e.currentConsumerId = null;
+            e.leaseExpiresAt = 0;
+            e.nextVisibleAt = t;
+            e.activeReplayNo = replayNo;
+            e.activeReplayKind = DeliveryKind.DEAD_LETTER_REPLAY;
+            e.activeReplayOperator = operator;
+            if (snap.getCommittedOffset() >= e.offset) {
+                long old = snap.getCommittedOffset();
+                snap.setCommittedOffset(e.offset - 1);
+                emit(group, e.messageId, e.offset, DecisionCode.OFFSET_COMMITTED,
+                        "committed offset operator-rewound for dead-letter replay: "
+                                + old + " -> " + snap.getCommittedOffset()
+                                + " (no unacknowledged message below is crossed)");
+            }
+            emit(group, e.messageId, e.offset, DecisionCode.DEAD_LETTER_REPLAY_ACCEPTED,
+                    "manual dead-letter replay accepted: replayNo=" + replayNo
+                            + " operator=" + operator + " reason=" + reason
+                            + " historicalAttempts=" + e.attempts.size()
+                            + " maxAttempts=" + cfg.maxAttempts()
+                            + " (continuation of the same message; original dead-letter "
+                            + "record retained; retry budget stays capped)");
+            store.persist(state);
+            return rec;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 消费进度回退重放：把本组的已提交位点有控制地回退到 {@code targetOffset}，
+     * 自该位点起的历史消息（含以前成功过的）作为<b>重放</b>重新投递，而不是新消息。
+     *
+     * <p>只影响目标组，其他组的位点与状态完全不动。回退后：</p>
+     * <ul>
+     *   <li>区间内任何 {@code IN_FLIGHT}（未确认租约）都使操作以
+     *       {@link DecisionCode#REWIND_REJECTED_INFLIGHT} 拒绝——不能越过还没确认的消息；</li>
+     *   <li>target 不早于当前水线（没有更早的位置可退）以
+     *       {@link DecisionCode#REWIND_REJECTED_NOT_BEHIND} 拒绝；</li>
+     *   <li>target 越界以 {@link DecisionCode#REWIND_REJECTED_RANGE} 拒绝；</li>
+     *   <li>三类拒绝互不混淆，且拒绝时不做任何变更、不落盘；</li>
+     *   <li>以前成功过的消息重放时仍带历史 attemptNo 与 replayNo；其业务效果由
+     *       {@link #hasBusinessEffectTaken(String, long)} 幂等查询配合处理器抑制，
+     *       broker 对“第二次成功”记 {@link DecisionCode#DUPLICATE_EFFECT_SUPPRESSED}。</li>
+     * </ul>
+     */
+    public List<ReplayRecord> rewindCommittedOffset(String group, long targetOffset,
+                                                    String operator, String reason) {
+        lock.lock();
+        try {
+            ConsumerGroupConfig cfg = requireGroup(group);
+            GroupSnapshot snap = state.getGroups().get(group);
+            long current = snap.getCommittedOffset();
+            long maxOffset = snap.getEntries().size() - 1L;
+
+            if (targetOffset < 0 || targetOffset > maxOffset) {
+                rejectReplay(group, targetOffset, current, DecisionCode.REWIND_REJECTED_RANGE,
+                        "offset rewind rejected: target=" + targetOffset
+                                + " out of range [0," + maxOffset + "]");
+            }
+            if (targetOffset >= current + 1) {
+                rejectReplay(group, targetOffset, current,
+                        DecisionCode.REWIND_REJECTED_NOT_BEHIND,
+                        "offset rewind rejected: target=" + targetOffset
+                                + " is not earlier than committed+1=" + (current + 1)
+                                + " (nothing earlier to replay)");
+            }
+            // 从 target 起的任何位置（含水线之后已租出但未确认的消息）只要还 IN_FLIGHT，
+            // 回退后水位重新前进时就必然要“越过”这道未确认的坎，因此一律拒绝。
+            for (GroupSnapshot.Entry in : snap.getEntries()) {
+                if (in.offset < targetOffset) {
+                    continue;
+                }
+                if (in.state == MessageState.IN_FLIGHT) {
+                    rejectReplay(group, targetOffset, current,
+                            DecisionCode.REWIND_REJECTED_INFLIGHT,
+                            "offset rewind rejected: unacknowledged lease exists at offset="
+                                    + in.offset + " state=IN_FLIGHT leaseId=" + in.currentLeaseId
+                                    + " consumer=" + in.currentConsumerId
+                                    + " (target=" + targetOffset + ", committed=" + current
+                                    + "); committed offset left untouched");
+                }
+            }
+
+            long t = now();
+            List<ReplayRecord> reopened = new ArrayList<>();
+            int resetPending = 0;
+            int resetWaiting = 0;
+            int reopenedSucceeded = 0;
+            int reopenedDead = 0;
+            for (GroupSnapshot.Entry e : snap.getEntries()) {
+                if (e.offset < targetOffset) {
+                    continue;
+                }
+                if (e.state == MessageState.IN_FLIGHT) {
+                    // 校验阶段已保证不会走到这里
+                    rejectReplay(group, targetOffset, current,
+                            DecisionCode.REWIND_REJECTED_INFLIGHT,
+                            "unexpected in-flight at " + e.offset);
+                }
+                if (e.state.isTerminal()) {
+                    int replayNo = e.replayCount() + 1;
+                    ReplayRecord rec = new ReplayRecord(replayNo, DeliveryKind.OFFSET_REWIND,
+                            operator, reason, e.offset, e.messageId, t);
+                    e.replays.add(rec);
+                    e.state = MessageState.PENDING;
+                    e.currentLeaseId = null;
+                    e.currentConsumerId = null;
+                    e.leaseExpiresAt = 0;
+                    e.nextVisibleAt = t;
+                    e.activeReplayNo = replayNo;
+                    e.activeReplayKind = DeliveryKind.OFFSET_REWIND;
+                    e.activeReplayOperator = operator;
+                    reopened.add(rec);
+                    if (e.succeededOnce) {
+                        reopenedSucceeded++;
+                    } else {
+                        reopenedDead++;
+                    }
+                } else if (e.state == MessageState.RETRY_WAIT) {
+                    // 非终态本就在水线之后；回退窗口扫到它时只取消退避等待，不记为重放动作
+                    e.state = MessageState.PENDING;
+                    e.nextVisibleAt = t;
+                    resetWaiting++;
+                } else if (e.state == MessageState.PENDING) {
+                    resetPending++;
+                }
+            }
+            snap.setCommittedOffset(targetOffset - 1);
+            emit(group, null, targetOffset, DecisionCode.OFFSET_REWIND_ACCEPTED,
+                    "committed offset rewound by operator: " + current + " -> "
+                            + (targetOffset - 1) + " (replay starts at target=" + targetOffset
+                            + "); terminal messages reopened=" + reopened.size()
+                            + " (succeeded=" + reopenedSucceeded
+                            + " keep their single-effect guarantee via idempotency guard; dead="
+                            + reopenedDead
+                            + " stay under the same maxAttempts=" + cfg.maxAttempts() + ")"
+                            + " waitingBackoffCleared=" + resetWaiting
+                            + " alreadyPending=" + resetPending
+                            + " operator=" + operator + " reason=" + reason
+                            + " (only this group is affected)");
+            store.persist(state);
+            return reopened;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void rejectReplay(String group, long target, long current,
+                              DecisionCode code, String detail) {
+        emit(group, null, target, code, detail);
+        throw new ReplayRejectedException(group, target, current, code, detail);
+    }
+
     // ------------------------------------------------------------------ 查询
 
     public long getCommittedOffset(String group) {
@@ -455,6 +732,49 @@ public class LocalMessageBroker {
             requireGroup(group);
             GroupSnapshot.Entry e = state.getGroups().get(group).entryAt(offset);
             return e == null ? 0 : e.attemptCount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 业务幂等护栏：该消息是否已在本组成功生效过（含本次进程启动前的历史）。
+     * 处理器在进度回退重放场景下应先查询本方法：返回 true 时跳过业务写操作、直接返回成功，
+     * broker 仍会记录 {@code DUPLICATE_EFFECT_SUPPRESSED} 轨迹，保证业务效果全组只算一次。
+     */
+    public boolean hasBusinessEffectTaken(String group, long offset) {
+        lock.lock();
+        try {
+            requireGroup(group);
+            GroupSnapshot.Entry e = state.getGroups().get(group).entryAt(offset);
+            return e != null && e.succeededOnce;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 某条消息在本组内的全部运维重放记录（死信重投/进度回退），按时间顺序。 */
+    public List<ReplayRecord> getReplays(String group, long offset) {
+        lock.lock();
+        try {
+            requireGroup(group);
+            GroupSnapshot.Entry e = state.getGroups().get(group).entryAt(offset);
+            return e == null ? List.of() : new ArrayList<>(e.replays);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 本组内所有消息的运维重放记录（按位点、时间顺序）。 */
+    public List<ReplayRecord> getAllReplays(String group) {
+        lock.lock();
+        try {
+            requireGroup(group);
+            List<ReplayRecord> all = new ArrayList<>();
+            for (GroupSnapshot.Entry e : state.getGroups().get(group).getEntries()) {
+                all.addAll(e.replays);
+            }
+            return all;
         } finally {
             lock.unlock();
         }
