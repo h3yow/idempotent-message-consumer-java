@@ -11,6 +11,8 @@ package com.github.h3yow.idempotentmessageconsumerjava.mq.model;
  * @param attemptNo      本次是第几次尝试（首次投递为 1）
  * @param grantedAt      租约发放时间（epoch millis）
  * @param leaseExpiresAt 租约到期时间（epoch millis）
+ * @param deliveryCause  本次投递的触发原因：NORMAL（首次/自动重试/租约超时重投）、
+ *                       REDELIVER（人工死信重投）、REPLAY（消费进度重放）
  */
 public record LeasedMessage(String leaseId,
                             String group,
@@ -18,5 +20,13 @@ public record LeasedMessage(String leaseId,
                             Message message,
                             int attemptNo,
                             long grantedAt,
-                            long leaseExpiresAt) {
+                            long leaseExpiresAt,
+                            String deliveryCause) {
+
+    /** 普通投递（首次或自动重试）。 */
+    public static final String CAUSE_NORMAL = "NORMAL";
+    /** 人工死信重投触发的投递。 */
+    public static final String CAUSE_REDELIVER = "REDELIVER";
+    /** 消费进度重放触发的投递。 */
+    public static final String CAUSE_REPLAY = "REPLAY";
 }

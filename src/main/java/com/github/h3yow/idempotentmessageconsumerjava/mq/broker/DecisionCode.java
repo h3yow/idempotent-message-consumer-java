@@ -33,6 +33,18 @@ public enum DecisionCode {
     OFFSET_COMMIT_REJECTED_GAP,     // 目标区间内仍有未确认消息（跨未确认提交被拒绝）
     OFFSET_COMMIT_REJECTED_RANGE,   // 目标位点超出当前最大位点
 
+    /* ---- 死信重投（人工补偿） ---- */
+    REDELIVERED_FROM_DEAD_LETTER,   // 死信被人工重投，重新进入待投递（原死信记录保留）
+    REDELIVER_REJECTED_UNKNOWN_MESSAGE, // 重投被拒绝：组内不存在该消息
+    REDELIVER_REJECTED_NOT_DEAD,    // 重投被拒绝：消息当前不是死信终态
+    REDELIVER_DISPATCHED,           // 被人工重投的消息再次投递（与自动重试可区分）
+
+    /* ---- 消费进度重放 ---- */
+    REPLAY_SCHEDULED,               // 进度回退被接受，已处理消息被重置为待重放
+    REPLAY_REJECTED_NOT_BACKWARD,   // 重放被拒绝：目标位点不是回退（>= 当前已提交位点）
+    REPLAY_REJECTED_RANGE,          // 重放被拒绝：目标位点越界
+    REPLAY_DISPATCHED,              // 因重放而再次投递（与新消息可区分）
+
     /* ---- 重启恢复 ---- */
     RECOVERED_ON_STARTUP,           // 启动时加载快照，未确认租约重置为待投递
     PERSISTED                       // 状态已持久化

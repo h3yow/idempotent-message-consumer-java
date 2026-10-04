@@ -26,6 +26,13 @@ public final class GroupSnapshot {
         public long leaseExpiresAt;
         /** RETRY_WAIT 状态下，最早允许再次投递的时间（epoch millis）。 */
         public long nextVisibleAt;
+        /** 人工死信重投次数。每次重投在重试上限之外恰好多给一次投递机会。 */
+        public int redeliveryCount;
+        /** 因进度重放被重置回待投递的次数。 */
+        public int replayCount;
+        /** 非 null 表示本次回到 PENDING 的原因："REDELIVER"（人工重投）/ "REPLAY"（进度重放），
+         *  投递时写入轨迹后清除；持久化字段，重启后不丢失。 */
+        public String pendingCause;
         public List<AttemptRecord> attempts = new ArrayList<>();
 
         public Entry() {
